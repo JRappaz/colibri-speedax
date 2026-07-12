@@ -83,7 +83,13 @@ class QwenMoeFixtureTests(unittest.TestCase):
                     "8",
                 ],
                 cwd=ROOT,
-                env=os.environ | {"SNAP": str(converted)},
+                env=os.environ
+                | {
+                    "SNAP": str(converted),
+                    "SPEEDAX_PREFETCH": "1",
+                    "SPEEDAX_PILOT": "1",
+                    "SPEEDAX_PILOT_K": "2",
+                },
                 check=True,
                 text=True,
                 stdout=subprocess.PIPE,
@@ -91,6 +97,8 @@ class QwenMoeFixtureTests(unittest.TestCase):
             )
             self.assertIn("Qwen MoE tiny forward", result.stdout)
             self.assertIn("Matching tokens: 2/2", result.stdout)
+            self.assertIn("observed=1 pilot=1 pilot_k=2", result.stdout)
+            self.assertRegex(result.stdout, r"prefetch_calls=[1-9][0-9]*")
 
 
 if __name__ == "__main__":

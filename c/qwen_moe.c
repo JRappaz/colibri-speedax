@@ -15,6 +15,7 @@
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #endif
+#include "speedax_forecast.h"
 #include "st.h"
 
 typedef struct {
@@ -61,10 +62,15 @@ typedef struct {
     QwenLayer *L;
     QwenLayerCache *cache;
     uint64_t clock, hits, miss;
+    uint64_t prefetch_calls, forecast_items, forecast_skipped_cached;
     float **K, **V;
     int max_t;
     double dense_load_s;
 } QwenModel;
+
+static int g_speedax_prefetch = 0;
+static int g_speedax_pilot = 0;
+static int g_speedax_pilot_k = 0;
 
 static int json_int_default(jval *root, const char *key, int fallback) {
     jval *v = json_get(root, key);
@@ -368,6 +374,37 @@ static void read_expert_quant(QwenModel *m, const char *name, int8_t *q, float *
     st_read_f32(&m->S, qs, scale, 1);
 }
 
+static int qwen_expert_cached(QwenModel *m, int layer, int eid) {
+    QwenLayerCache *lc = &m->cache[layer];
+    for (int i = 0; i < lc->n; i++) if (lc->slots[i].eid == eid) return 1;
+    return 0;
+}
+
+static void qwen_expert_prefetch(QwenModel *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 || eid >= m->c.n_experts) return;
+    if (qwen_expert_cached(m, layer, eid)) {
+        m->forecast_skipped_cached++;
+        return;
+    }
+    char nm[512];
+    const char *proj[] = {"gate_proj", "up_proj", "down_proj"};
+    for (int p = 0; p < 3; p++) {
+        snprintf(nm, sizeof(nm), "model.layers.%d.mlp.experts.%d.%s.weight", layer, eid, proj[p]);
+        st_prefetch(&m->S, nm);
+        char qs[640];
+        snprintf(qs, sizeof(qs), "%s.qs", nm);
+        st_prefetch(&m->S, qs);
+    }
+    m->prefetch_calls++;
+}
+
+static void qwen_prefetch_forecast(QwenModel *m, const forecast_item *items, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        if (!forecast_item_valid(&items[i])) continue;
+        qwen_expert_prefetch(m, (int)items[i].layer, (int)items[i].expert);
+    }
+}
+
 static void expert_get(QwenModel *m, int layer, int eid, QwenSlot **out) {
     QwenLayerCache *lc = &m->cache[layer];
     for (int i = 0; i < lc->n; i++) {
@@ -512,38 +549,65 @@ static void qwen_moe(QwenModel *m, QwenLayer *l, int layer, float *x, int S, flo
     matmul(logits, x, l->gate, S, D, E);
     memset(out, 0, (size_t)S * D * sizeof(float));
     float *g = falloc(I), *u = falloc(I), *mid = falloc(I), *hh = falloc(D), *shared = falloc(D);
+    int *all_idx = malloc((size_t)S * K * sizeof(int));
+    float *all_val = malloc((size_t)S * K * sizeof(float));
+    if (!all_idx || !all_val) { fprintf(stderr, "OOM qwen route scratch\n"); exit(1); }
     for (int s = 0; s < S; s++) {
         float *pr = logits + (int64_t)s * E;
         softmax_row(pr, E);
-        int idx[128];
-        float val[128];
         if (K > 128) { fprintf(stderr, "topk too large for qwen_moe scratch: %d\n", K); exit(1); }
         for (int kk = 0; kk < K; kk++) {
             int best = -1;
             float bv = -1e30f;
             for (int e = 0; e < E; e++) {
                 int taken = 0;
-                for (int j = 0; j < kk; j++) if (idx[j] == e) { taken = 1; break; }
+                for (int j = 0; j < kk; j++) if (all_idx[(int64_t)s * K + j] == e) { taken = 1; break; }
                 if (!taken && pr[e] > bv) { bv = pr[e]; best = e; }
             }
-            idx[kk] = best;
-            val[kk] = bv;
+            all_idx[(int64_t)s * K + kk] = best;
+            all_val[(int64_t)s * K + kk] = bv;
         }
         if (c->norm_topk) {
             float sm = 0.f;
-            for (int kk = 0; kk < K; kk++) sm += val[kk];
-            for (int kk = 0; kk < K; kk++) val[kk] /= sm;
+            for (int kk = 0; kk < K; kk++) sm += all_val[(int64_t)s * K + kk];
+            for (int kk = 0; kk < K; kk++) all_val[(int64_t)s * K + kk] /= sm;
         }
+    }
+    if (g_speedax_prefetch) {
+        forecast_item *items = malloc((size_t)S * K * sizeof(forecast_item));
+        if (!items) { fprintf(stderr, "OOM qwen forecast\n"); exit(1); }
+        size_t n = 0;
+        for (int s = 0; s < S; s++) {
+            for (int kk = 0; kk < K; kk++) {
+                int eid = all_idx[(int64_t)s * K + kk];
+                int seen = 0;
+                for (size_t j = 0; j < n; j++) {
+                    if (items[j].layer == (uint16_t)layer && items[j].expert == (uint16_t)eid) {
+                        seen = 1;
+                        break;
+                    }
+                }
+                if (!seen) {
+                    n = forecast_push(items, n, (size_t)S * K, (uint16_t)layer, (uint16_t)eid,
+                                      (uint32_t)(layer + 1), all_val[(int64_t)s * K + kk]);
+                }
+            }
+        }
+        m->forecast_items += n;
+        qwen_prefetch_forecast(m, items, n);
+        free(items);
+    }
+    for (int s = 0; s < S; s++) {
         const float *xs = x + (int64_t)s * D;
         float *os = out + (int64_t)s * D;
         for (int kk = 0; kk < K; kk++) {
             QwenSlot *e;
-            expert_get(m, layer, idx[kk], &e);
+            expert_get(m, layer, all_idx[(int64_t)s * K + kk], &e);
             matmul_q(g, xs, e->g, e->gs, D, I);
             matmul_q(u, xs, e->u, e->us, D, I);
             for (int i = 0; i < I; i++) mid[i] = silu(g[i]) * u[i];
             matmul_q(hh, mid, e->d, e->ds, I, D);
-            for (int d = 0; d < D; d++) os[d] += val[kk] * hh[d];
+            for (int d = 0; d < D; d++) os[d] += all_val[(int64_t)s * K + kk] * hh[d];
         }
         qwen_shared_expert(m, l, xs, shared);
         for (int d = 0; d < D; d++) os[d] += shared[d];
@@ -554,6 +618,54 @@ static void qwen_moe(QwenModel *m, QwenLayer *l, int layer, float *x, int S, flo
     free(mid);
     free(hh);
     free(shared);
+    free(all_idx);
+    free(all_val);
+}
+
+static void qwen_pilot_prefetch_next(QwenModel *m, int layer, const float *x, int S) {
+    QwenCfg *c = &m->c;
+    if (layer < 0 || layer >= c->n_layers) return;
+    int D = c->hidden, E = c->n_experts;
+    int K = g_speedax_pilot_k > 0 && g_speedax_pilot_k < c->topk ? g_speedax_pilot_k : c->topk;
+    QwenLayer *l = &m->L[layer];
+    float *nrm = falloc(D);
+    float *scores = falloc(E);
+    forecast_item *items = malloc((size_t)S * K * sizeof(forecast_item));
+    if (!items) { fprintf(stderr, "OOM qwen pilot forecast\n"); exit(1); }
+    size_t n = 0;
+    for (int s = 0; s < S; s++) {
+        rmsnorm_row(nrm, x + (int64_t)s * D, l->post_ln, D, c->eps);
+        matmul(scores, nrm, l->gate, 1, D, E);
+        softmax_row(scores, E);
+        int selected[128];
+        if (K > 128) { fprintf(stderr, "pilot topk too large: %d\n", K); exit(1); }
+        for (int kk = 0; kk < K; kk++) {
+            int best = -1;
+            float bv = -1e30f;
+            for (int e = 0; e < E; e++) {
+                int seen = 0;
+                for (int j = 0; j < kk; j++) if (selected[j] == e) { seen = 1; break; }
+                if (!seen && scores[e] > bv) { bv = scores[e]; best = e; }
+            }
+            selected[kk] = best;
+            int dup = 0;
+            for (size_t j = 0; j < n; j++) {
+                if (items[j].layer == (uint16_t)layer && items[j].expert == (uint16_t)best) {
+                    dup = 1;
+                    break;
+                }
+            }
+            if (!dup) {
+                n = forecast_push(items, n, (size_t)S * K, (uint16_t)layer, (uint16_t)best,
+                                  (uint32_t)(layer + 1), bv);
+            }
+        }
+    }
+    m->forecast_items += n;
+    qwen_prefetch_forecast(m, items, n);
+    free(nrm);
+    free(scores);
+    free(items);
 }
 
 static float *qwen_step(QwenModel *m, const int *ids, int S, int pos_base) {
@@ -568,6 +680,7 @@ static float *qwen_step(QwenModel *m, const int *ids, int S, int pos_base) {
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s * D, x + (int64_t)s * D, l->in_ln, D, c->eps);
         qwen_attention(m, l, i, nrm, S, pos_base, tmp);
         for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
+        if (g_speedax_pilot && i + 1 < c->n_layers) qwen_pilot_prefetch_next(m, i + 1, x, S);
         for (int s = 0; s < S; s++) rmsnorm_row(nrm + (int64_t)s * D, x + (int64_t)s * D, l->post_ln, D, c->eps);
         qwen_moe(m, l, i, nrm, S, tmp);
         for (int64_t j = 0; j < (int64_t)S * D; j++) x[j] += tmp[j];
@@ -624,6 +737,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "set SNAP=<Qwen MoE snapshot directory>\n");
         return 1;
     }
+    g_speedax_prefetch = getenv("SPEEDAX_PREFETCH") ? atoi(getenv("SPEEDAX_PREFETCH")) : 0;
+    g_speedax_pilot = getenv("SPEEDAX_PILOT") ? atoi(getenv("SPEEDAX_PILOT")) : 0;
+    g_speedax_pilot_k = getenv("SPEEDAX_PILOT_K") ? atoi(getenv("SPEEDAX_PILOT_K")) : 0;
+    if (g_speedax_pilot_k < 0) g_speedax_pilot_k = 0;
     QwenCfg cfg;
     memset(&cfg, 0, sizeof(cfg));
     qwen_load_cfg(&cfg, snap);
@@ -689,6 +806,13 @@ int main(int argc, char **argv) {
            tot ? 100.0 * (double)m.hits / tot : 0.0,
            (unsigned long long)m.hits,
            (unsigned long long)m.miss);
+    printf("Speedax forecast items=%llu prefetch_calls=%llu skipped_cached=%llu observed=%d pilot=%d pilot_k=%d\n",
+           (unsigned long long)m.forecast_items,
+           (unsigned long long)m.prefetch_calls,
+           (unsigned long long)m.forecast_skipped_cached,
+           g_speedax_prefetch,
+           g_speedax_pilot,
+           g_speedax_pilot_k);
     printf("Speed: %.2f tok/s (%.3fs for %d tokens)\n", n_new / dt, dt, n_new);
     free(buf);
     free(arena);
