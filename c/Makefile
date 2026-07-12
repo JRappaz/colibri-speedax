@@ -20,6 +20,8 @@ OMPL    =
 endif
 CFLAGS  = -O3 $(OMPC) -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm $(OMPL)
+QWEN_CFLAGS = $(CFLAGS) -DACCELERATE_NEW_LAPACK
+QWEN_LDFLAGS = $(LDFLAGS) -framework Accelerate
 EXE     =
 else ifneq ($(IS_WIN),)
 # --- Windows 11 x86-64 (MinGW-w64 / MSYS2) ---
@@ -31,6 +33,8 @@ CC      = gcc
 ARCH   ?= x86-64-v3
 CFLAGS  = -D_FILE_OFFSET_BITS=64 -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp -static
+QWEN_LDFLAGS = $(LDFLAGS)
+QWEN_CFLAGS = $(CFLAGS)
 EXE     = .exe
 else
 # --- Linux x86-64 (percorso originale, invariato) ---
@@ -41,6 +45,8 @@ CC      = gcc
 ARCH   ?= native
 CFLAGS  = -O3 -march=$(ARCH) -fopenmp -Wall -Wextra -Wno-unused-parameter -Wno-misleading-indentation -Wno-unused-function
 LDFLAGS = -lm -fopenmp
+QWEN_LDFLAGS = $(LDFLAGS)
+QWEN_CFLAGS = $(CFLAGS)
 EXE     =
 endif
 
@@ -89,7 +95,7 @@ qwen_moe: qwen_moe$(EXE)
 endif
 
 qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h
-	$(CC) $(CFLAGS) qwen_moe.c -o qwen_moe$(EXE) $(LDFLAGS) -pthread
+	$(CC) $(QWEN_CFLAGS) qwen_moe.c -o qwen_moe$(EXE) $(QWEN_LDFLAGS) -pthread
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)

@@ -13,6 +13,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#if defined(__APPLE__)
+#include <Accelerate/Accelerate.h>
+#ifdef I
+#undef I
+#endif
+#endif
 #if defined(__APPLE__) || defined(__linux__)
 #include <sys/resource.h>
 #endif
@@ -137,6 +143,14 @@ static int8_t *ialloc(int64_t n) {
 }
 
 static void matmul(float *y, const float *x, const float *W, int S, int I, int O) {
+#if defined(__APPLE__)
+    if (S == 1) {
+        cblas_sgemv(CblasRowMajor, CblasNoTrans, O, I, 1.0f, W, I, x, 1, 0.0f, y, 1);
+    } else {
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans, S, O, I,
+                    1.0f, x, I, W, I, 0.0f, y, O);
+    }
+#else
     #pragma omp parallel for schedule(static)
     for (int o = 0; o < O; o++) {
         const float *w = W + (int64_t)o * I;
@@ -147,6 +161,7 @@ static void matmul(float *y, const float *x, const float *W, int S, int I, int O
             y[(int64_t)s * O + o] = acc;
         }
     }
+#endif
 }
 
 static void add_bias(float *y, const float *b, int S, int O) {
