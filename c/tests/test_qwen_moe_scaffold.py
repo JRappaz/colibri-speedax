@@ -39,7 +39,8 @@ class QwenMoeScaffoldTests(unittest.TestCase):
             )
         self.assertIn("Qwen MoE backend scaffold", result.stdout)
         self.assertIn("(layer_id, expert_id)", result.stdout)
-        self.assertIn("scaffold/config load succeeded", result.stderr)
+        self.assertIn("config-only scaffold check", result.stdout)
+        self.assertIn("scaffold/layout check succeeded", result.stderr)
 
 
 if __name__ == "__main__":

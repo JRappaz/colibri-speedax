@@ -84,7 +84,9 @@ cuda-test: backend_cuda.cu backend_cuda.h tests/test_backend_cuda.cu
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/test_backend_cuda.cu -o backend_cuda_test$(EXE)
 	./backend_cuda_test$(EXE)
 
+ifneq ($(EXE),)
 qwen_moe: qwen_moe$(EXE)
+endif
 
 qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) qwen_moe.c -o qwen_moe$(EXE) $(LDFLAGS)

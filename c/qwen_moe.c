@@ -18,6 +18,16 @@ typedef struct {
     int norm_topk;
 } QwenCfg;
 
+typedef struct {
+    int dense_missing;
+    int expert_missing;
+    int expert_scale_missing;
+    int expert_tensors;
+    int64_t dense_bytes;
+    int64_t expert_bytes;
+    int64_t scale_bytes;
+} QwenLayoutStats;
+
 static int json_int_default(jval *root, const char *key, int fallback) {
     jval *v = json_get(root, key);
     return v ? (int)v->num : fallback;
@@ -85,6 +95,92 @@ static void qwen_print_cfg(const QwenCfg *c) {
            "model.layers.<layer>.mlp.experts.<expert>.*.weight\n");
 }
 
+static int qwen_require(shards *S, const char *name, const char *kind, QwenLayoutStats *st) {
+    int64_t nbytes = st_nbytes(S, name);
+    if (nbytes < 0) {
+        fprintf(stderr, "missing %s tensor: %s\n", kind, name);
+        return 0;
+    }
+    if (!strcmp(kind, "expert")) {
+        st->expert_tensors++;
+        st->expert_bytes += nbytes;
+    } else if (!strcmp(kind, "scale")) {
+        st->scale_bytes += nbytes;
+    } else {
+        st->dense_bytes += nbytes;
+    }
+    return 1;
+}
+
+static int qwen_check_layout(const QwenCfg *cfg, const char *snap, QwenLayoutStats *stats) {
+    shards S;
+    st_init(&S, snap);
+    if (S.n == 0) {
+        printf("no safetensors found; config-only scaffold check\n");
+        return 1;
+    }
+
+    const char *top[] = {
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    };
+    for (int i = 0; i < (int)(sizeof(top) / sizeof(top[0])); i++) {
+        if (!qwen_require(&S, top[i], "dense", stats)) stats->dense_missing++;
+    }
+
+    char name[512];
+    for (int l = 0; l < cfg->n_layers; l++) {
+        const char *layer_dense[] = {
+            "model.layers.%d.input_layernorm.weight",
+            "model.layers.%d.post_attention_layernorm.weight",
+            "model.layers.%d.self_attn.q_proj.weight",
+            "model.layers.%d.self_attn.k_proj.weight",
+            "model.layers.%d.self_attn.v_proj.weight",
+            "model.layers.%d.self_attn.o_proj.weight",
+            "model.layers.%d.mlp.gate.weight",
+        };
+        for (int i = 0; i < (int)(sizeof(layer_dense) / sizeof(layer_dense[0])); i++) {
+            snprintf(name, sizeof(name), layer_dense[i], l);
+            if (!qwen_require(&S, name, "dense", stats)) stats->dense_missing++;
+        }
+
+        const char *optional_dense[] = {
+            "model.layers.%d.self_attn.q_proj.bias",
+            "model.layers.%d.self_attn.k_proj.bias",
+            "model.layers.%d.self_attn.v_proj.bias",
+            "model.layers.%d.mlp.shared_expert.gate_proj.weight",
+            "model.layers.%d.mlp.shared_expert.up_proj.weight",
+            "model.layers.%d.mlp.shared_expert.down_proj.weight",
+            "model.layers.%d.mlp.shared_expert_gate.weight",
+        };
+        for (int i = 0; i < (int)(sizeof(optional_dense) / sizeof(optional_dense[0])); i++) {
+            snprintf(name, sizeof(name), optional_dense[i], l);
+            if (st_has(&S, name)) qwen_require(&S, name, "dense", stats);
+        }
+
+        for (int e = 0; e < cfg->n_experts; e++) {
+            const char *proj[] = {"gate_proj", "up_proj", "down_proj"};
+            for (int p = 0; p < 3; p++) {
+                snprintf(name, sizeof(name),
+                         "model.layers.%d.mlp.experts.%d.%s.weight", l, e, proj[p]);
+                if (!qwen_require(&S, name, "expert", stats)) stats->expert_missing++;
+                snprintf(name, sizeof(name),
+                         "model.layers.%d.mlp.experts.%d.%s.weight.qs", l, e, proj[p]);
+                if (!qwen_require(&S, name, "scale", stats)) stats->expert_scale_missing++;
+            }
+        }
+    }
+
+    printf("layout tensors=%d dense=%.2f MB experts=%.2f MB scales=%.2f MB expert_tensors=%d\n",
+           S.n,
+           stats->dense_bytes / 1048576.0,
+           stats->expert_bytes / 1048576.0,
+           stats->scale_bytes / 1048576.0,
+           stats->expert_tensors);
+    return stats->dense_missing == 0 && stats->expert_missing == 0 && stats->expert_scale_missing == 0;
+}
+
 int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
@@ -101,6 +197,13 @@ int main(int argc, char **argv) {
         fprintf(stderr, "invalid or unsupported Qwen MoE config in %s/config.json\n", snap);
         return 2;
     }
-    fprintf(stderr, "qwen_moe forward path is not implemented yet; scaffold/config load succeeded.\n");
+    QwenLayoutStats stats;
+    memset(&stats, 0, sizeof(stats));
+    if (!qwen_check_layout(&cfg, snap, &stats)) {
+        fprintf(stderr, "invalid Qwen MoE tensor layout: dense_missing=%d expert_missing=%d scale_missing=%d\n",
+                stats.dense_missing, stats.expert_missing, stats.expert_scale_missing);
+        return 3;
+    }
+    fprintf(stderr, "qwen_moe forward path is not implemented yet; scaffold/layout check succeeded.\n");
     return 0;
 }

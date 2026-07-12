@@ -10,6 +10,11 @@ Milestone 0 keeps the storage contract simple:
 The runtime backend will stream routed expert tensors by layer/expert using
 these names:
   model.layers.<layer>.mlp.experts.<expert>.(gate_proj|up_proj|down_proj).weight
+
+Recent Transformers Qwen2-MoE checkpoints store routed experts packed as:
+  model.layers.<layer>.mlp.experts.gate_up_proj  [E, 2I, H]
+  model.layers.<layer>.mlp.experts.down_proj     [E, H, I]
+The converter unpacks those tensors into the per-expert names above.
 """
 
 from __future__ import annotations
@@ -32,6 +37,9 @@ EXPERT_KEY_RE = re.compile(
     r"model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<expert>\d+)\."
     r"(?P<proj>gate_proj|up_proj|down_proj)\.weight$"
 )
+PACKED_EXPERT_KEY_RE = re.compile(
+    r"model\.layers\.(?P<layer>\d+)\.mlp\.experts\.(?P<proj>gate_up_proj|down_proj)$"
+)
 
 
 def parse_expert_key(name: str) -> tuple[int, int, str] | None:
@@ -43,6 +51,17 @@ def parse_expert_key(name: str) -> tuple[int, int, str] | None:
 
 def is_expert_weight(name: str) -> bool:
     return parse_expert_key(name) is not None
+
+
+def parse_packed_expert_key(name: str) -> tuple[int, str] | None:
+    match = PACKED_EXPERT_KEY_RE.fullmatch(name)
+    if not match:
+        return None
+    return int(match.group("layer")), match.group("proj")
+
+
+def expert_weight_name(layer: int, expert: int, proj: str) -> str:
+    return f"model.layers.{layer}.mlp.experts.{expert}.{proj}.weight"
 
 
 def quantize_row(w: torch.Tensor, bits: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -81,6 +100,7 @@ def resolve_source(repo: str | None, model: str | None) -> Path:
 def main() -> None:
     try:
         from safetensors.torch import load_file, save_file
+        import torch
     except ImportError as exc:
         sys.exit(f"Missing dependencies: {exc}. Install: pip install torch safetensors")
 
@@ -119,17 +139,42 @@ def main() -> None:
         converted = {}
         for name, tensor in tensors.items():
             parsed = parse_expert_key(name)
-            if parsed is None:
+            if parsed is not None:
+                layer, expert, _ = parsed
+                q, scales = quantize_row(tensor, args.ebits)
+                converted[name] = q
+                converted[name + ".qs"] = scales
+                expert_tensors += 1
+                expert_objects.add((layer, expert))
+                total_expert_f32 += tensor.numel() * tensor.element_size()
+                total_expert_q += q.numel() + scales.numel() * 4
+                continue
+
+            packed = parse_packed_expert_key(name)
+            if packed is None:
                 converted[name] = tensor
                 continue
-            layer, expert, _ = parsed
-            q, scales = quantize_row(tensor, args.ebits)
-            converted[name] = q
-            converted[name + ".qs"] = scales
-            expert_tensors += 1
-            expert_objects.add((layer, expert))
-            total_expert_f32 += tensor.numel() * tensor.element_size()
-            total_expert_q += q.numel() + scales.numel() * 4
+
+            layer, packed_proj = packed
+            if tensor.dim() != 3:
+                sys.exit(f"Expected packed expert tensor {name} to be rank 3, got shape {tuple(tensor.shape)}")
+            if packed_proj == "gate_up_proj":
+                if tensor.shape[1] % 2:
+                    sys.exit(f"Expected even gate/up dimension for {name}, got shape {tuple(tensor.shape)}")
+                gate, up = torch.chunk(tensor, 2, dim=1)
+                pieces = (("gate_proj", gate), ("up_proj", up))
+            else:
+                pieces = (("down_proj", tensor),)
+            for expert in range(tensor.shape[0]):
+                for proj, expert_tensor in pieces:
+                    out_name = expert_weight_name(layer, expert, proj)
+                    q, scales = quantize_row(expert_tensor[expert].contiguous(), args.ebits)
+                    converted[out_name] = q
+                    converted[out_name + ".qs"] = scales
+                    expert_tensors += 1
+                    expert_objects.add((layer, expert))
+                    total_expert_f32 += expert_tensor[expert].numel() * expert_tensor.element_size()
+                    total_expert_q += q.numel() + scales.numel() * 4
         save_file(converted, str(out / shard.name))
         print("ok")
 
