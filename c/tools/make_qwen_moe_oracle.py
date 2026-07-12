@@ -13,24 +13,40 @@ import json
 from pathlib import Path
 
 
-def build_fixture(out: Path, ref: Path, seed: int = 1234, max_new_tokens: int = 8) -> None:
+def build_fixture(
+    out: Path,
+    ref: Path,
+    seed: int = 1234,
+    max_new_tokens: int = 8,
+    vocab_size: int = 128,
+    hidden_size: int = 32,
+    intermediate_size: int = 64,
+    moe_intermediate_size: int = 16,
+    shared_expert_intermediate_size: int = 16,
+    num_hidden_layers: int = 2,
+    num_attention_heads: int = 4,
+    num_key_value_heads: int = 2,
+    num_experts: int = 8,
+    num_experts_per_tok: int = 2,
+    max_position_embeddings: int = 128,
+) -> None:
     import torch
     from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
 
     torch.manual_seed(seed)
     cfg = Qwen2MoeConfig(
-        vocab_size=128,
-        hidden_size=32,
-        intermediate_size=64,
-        moe_intermediate_size=16,
+        vocab_size=vocab_size,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        moe_intermediate_size=moe_intermediate_size,
         decoder_sparse_step=1,
-        num_hidden_layers=2,
-        num_attention_heads=4,
-        num_key_value_heads=2,
-        num_experts=8,
-        num_experts_per_tok=2,
-        shared_expert_intermediate_size=16,
-        max_position_embeddings=128,
+        num_hidden_layers=num_hidden_layers,
+        num_attention_heads=num_attention_heads,
+        num_key_value_heads=num_key_value_heads,
+        num_experts=num_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        shared_expert_intermediate_size=shared_expert_intermediate_size,
+        max_position_embeddings=max_position_embeddings,
         tie_word_embeddings=False,
         rms_norm_eps=1e-6,
         rope_theta=1000000.0,
@@ -44,7 +60,7 @@ def build_fixture(out: Path, ref: Path, seed: int = 1234, max_new_tokens: int = 
             else:
                 p.zero_()
 
-    prompt = [3, 14, 15, 92, 65, 35]
+    prompt = [x % vocab_size for x in (3, 14, 15, 92, 65, 35)]
     ids = torch.tensor([prompt])
     with torch.no_grad():
         generated = model.generate(ids, max_new_tokens=max_new_tokens, do_sample=False, use_cache=True)
@@ -58,7 +74,19 @@ def build_fixture(out: Path, ref: Path, seed: int = 1234, max_new_tokens: int = 
     ref.write_text(
         json.dumps(
             {
-                "model": "tiny-random-qwen2-moe",
+                "model": "random-qwen2-moe",
+                "config": {
+                    "vocab_size": vocab_size,
+                    "hidden_size": hidden_size,
+                    "intermediate_size": intermediate_size,
+                    "moe_intermediate_size": moe_intermediate_size,
+                    "shared_expert_intermediate_size": shared_expert_intermediate_size,
+                    "num_hidden_layers": num_hidden_layers,
+                    "num_attention_heads": num_attention_heads,
+                    "num_key_value_heads": num_key_value_heads,
+                    "num_experts": num_experts,
+                    "num_experts_per_tok": num_experts_per_tok,
+                },
                 "seed": seed,
                 "prompt_ids": prompt,
                 "full_ids": full,
@@ -76,8 +104,35 @@ def main() -> None:
     parser.add_argument("--ref", default="ref_qwen_moe.json", help="Output JSON reference")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--max-new-tokens", type=int, default=8)
+    parser.add_argument("--vocab-size", type=int, default=128)
+    parser.add_argument("--hidden-size", type=int, default=32)
+    parser.add_argument("--intermediate-size", type=int, default=64)
+    parser.add_argument("--moe-intermediate-size", type=int, default=16)
+    parser.add_argument("--shared-expert-intermediate-size", type=int, default=16)
+    parser.add_argument("--num-hidden-layers", type=int, default=2)
+    parser.add_argument("--num-attention-heads", type=int, default=4)
+    parser.add_argument("--num-key-value-heads", type=int, default=2)
+    parser.add_argument("--num-experts", type=int, default=8)
+    parser.add_argument("--num-experts-per-tok", type=int, default=2)
+    parser.add_argument("--max-position-embeddings", type=int, default=128)
     args = parser.parse_args()
-    build_fixture(Path(args.out), Path(args.ref), seed=args.seed, max_new_tokens=args.max_new_tokens)
+    build_fixture(
+        Path(args.out),
+        Path(args.ref),
+        seed=args.seed,
+        max_new_tokens=args.max_new_tokens,
+        vocab_size=args.vocab_size,
+        hidden_size=args.hidden_size,
+        intermediate_size=args.intermediate_size,
+        moe_intermediate_size=args.moe_intermediate_size,
+        shared_expert_intermediate_size=args.shared_expert_intermediate_size,
+        num_hidden_layers=args.num_hidden_layers,
+        num_attention_heads=args.num_attention_heads,
+        num_key_value_heads=args.num_key_value_heads,
+        num_experts=args.num_experts,
+        num_experts_per_tok=args.num_experts_per_tok,
+        max_position_embeddings=args.max_position_embeddings,
+    )
     print(f"saved: {args.out} and {args.ref}")
 
 
