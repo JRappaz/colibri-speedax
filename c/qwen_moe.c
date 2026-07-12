@@ -843,7 +843,15 @@ int main(int argc, char **argv) {
     jval *ref = json_parse(buf, &arena);
     int np, nfull;
     int *prompt = read_int_array(ref, "prompt_ids", &np);
-    int *full = read_int_array(ref, "full_ids", &nfull);
+    int *full = NULL;
+    int compare_tokens = json_get(ref, "full_ids") != NULL;
+    if (compare_tokens) {
+        full = read_int_array(ref, "full_ids", &nfull);
+    } else {
+        jval *mn = json_get(ref, "max_new_tokens");
+        if (!mn) { fprintf(stderr, "reference JSON needs full_ids or max_new_tokens\n"); return 1; }
+        nfull = np + (int)mn->num;
+    }
     int n_new = nfull - np;
     if (n_new < 0) { fprintf(stderr, "invalid reference lengths\n"); return 1; }
 
@@ -858,14 +866,19 @@ int main(int argc, char **argv) {
     double dt = now_s() - t0;
 
     int match = 0;
-    printf("\nReference: ");
-    for (int i = np; i < nfull; i++) printf("%d ", full[i]);
+    if (compare_tokens) {
+        printf("\nReference: ");
+        for (int i = np; i < nfull; i++) printf("%d ", full[i]);
+    } else {
+        printf("\nReference: <bench-only; no expected tokens>");
+    }
     printf("\nC engine : ");
     for (int i = np; i < nfull; i++) {
         printf("%d ", out[i]);
-        if (out[i] == full[i]) match++;
+        if (compare_tokens && out[i] == full[i]) match++;
     }
-    printf("\nMatching tokens: %d/%d\n", match, n_new);
+    if (compare_tokens) printf("\nMatching tokens: %d/%d\n", match, n_new);
+    else printf("\nMatching tokens: skipped bench-only\n");
     double tot = (double)m.hits + (double)m.miss;
     printf("Expert cache hit rate: %.1f%% (hit=%llu miss=%llu)\n",
            tot ? 100.0 * (double)m.hits / tot : 0.0,
@@ -883,5 +896,5 @@ int main(int argc, char **argv) {
     printf("Speed: %.2f tok/s (%.3fs for %d tokens)\n", n_new / dt, dt, n_new);
     free(buf);
     free(arena);
-    return match == n_new ? 0 : 4;
+    return (!compare_tokens || match == n_new) ? 0 : 4;
 }

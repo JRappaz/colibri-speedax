@@ -11,6 +11,7 @@ desktop/src-tauri/gen/
 
 # binari compilati (si rigenerano con make / coli build)
 c/glm
+c/qwen_moe
 c/olmoe
 c/iobench
 c/tok_test
@@ -28,6 +29,7 @@ c/glm_tiny_i4/
 c/glm_tiny_mix/
 c/glm_bench_medium/
 c/bench/
+models/
 
 # pesi modello / artefatti di run
 *.safetensors
