@@ -76,6 +76,22 @@ class QwenMoeFixtureTests(unittest.TestCase):
             self.assertIn("expert_tensors=48", result.stdout)
             self.assertIn("layout check succeeded", result.stderr)
 
+            result = subprocess.run(
+                [
+                    str(ROOT / ("qwen_moe.exe" if os.name == "nt" else "qwen_moe")),
+                    str(ref),
+                    "8",
+                ],
+                cwd=ROOT,
+                env=os.environ | {"SNAP": str(converted)},
+                check=True,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            self.assertIn("Qwen MoE tiny forward", result.stdout)
+            self.assertIn("Matching tokens: 2/2", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
