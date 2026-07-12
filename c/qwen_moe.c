@@ -111,7 +111,11 @@ static double now_s(void) {
 }
 
 static double rss_gb(void) {
-#if defined(__APPLE__) || defined(__linux__)
+#if defined(__APPLE__)
+    struct rusage r;
+    getrusage(RUSAGE_SELF, &r);
+    return r.ru_maxrss / (1024.0 * 1024.0 * 1024.0);
+#elif defined(__linux__)
     struct rusage r;
     getrusage(RUSAGE_SELF, &r);
     return r.ru_maxrss / (1024.0 * 1024.0);
@@ -510,6 +514,36 @@ static void expert_get(QwenModel *m, int layer, int eid, QwenSlot **out) {
     *out = s;
 }
 
+static double qwen_preload_all_experts(QwenModel *m) {
+    QwenCfg *c = &m->c;
+    double t0 = now_s();
+    for (int layer = 0; layer < c->n_layers; layer++) {
+        for (int eid = 0; eid < c->n_experts; eid++) {
+            QwenSlot *slot = NULL;
+            expert_get(m, layer, eid, &slot);
+        }
+    }
+    double dt = now_s() - t0;
+    m->hits = 0;
+    m->miss = 0;
+    m->prefetch_calls = 0;
+    m->forecast_items = 0;
+    m->forecast_skipped_cached = 0;
+    m->prefetch_enqueued = 0;
+    m->prefetch_dropped = 0;
+    return dt;
+}
+
+static void qwen_reset_runtime_counters(QwenModel *m) {
+    m->hits = 0;
+    m->miss = 0;
+    m->prefetch_calls = 0;
+    m->forecast_items = 0;
+    m->forecast_skipped_cached = 0;
+    m->prefetch_enqueued = 0;
+    m->prefetch_dropped = 0;
+}
+
 static void rope_head(float *x, int pos, const QwenCfg *c) {
     int half = c->head_dim / 2;
     for (int j = 0; j < half; j++) {
@@ -829,6 +863,9 @@ int main(int argc, char **argv) {
     const char *refpath = argv[1];
     int cap = argc > 2 ? atoi(argv[2]) : cfg.n_experts;
     if (cap < 1) cap = 1;
+    int preload_experts = getenv("QWEN_PRELOAD_EXPERTS") ? atoi(getenv("QWEN_PRELOAD_EXPERTS")) : 0;
+    int warmup = getenv("QWEN_WARMUP") ? atoi(getenv("QWEN_WARMUP")) : 0;
+    if (preload_experts && cap < cfg.n_experts) cap = cfg.n_experts;
     FILE *f = fopen(refpath, "rb");
     if (!f) { perror(refpath); return 1; }
     fseek(f, 0, SEEK_END);
@@ -859,6 +896,20 @@ int main(int argc, char **argv) {
     QwenModel m;
     qwen_model_init(&m, snap, cap);
     printf("resident weights loaded in %.3fs | RSS after load: %.3f GB\n", m.dense_load_s, rss_gb());
+    if (preload_experts) {
+        double preload_s = qwen_preload_all_experts(&m);
+        printf("all experts preloaded in %.3fs | RSS after preload: %.3f GB\n", preload_s, rss_gb());
+    }
+    if (warmup) {
+        int *warm = malloc((size_t)nfull * sizeof(int));
+        if (!warm) { fprintf(stderr, "OOM warmup ids\n"); return 1; }
+        double warm_t0 = now_s();
+        qwen_generate(&m, prompt, np, n_new, warm);
+        double warm_dt = now_s() - warm_t0;
+        qwen_reset_runtime_counters(&m);
+        printf("warmup generation completed in %.3fs | RSS after warmup: %.3f GB\n", warm_dt, rss_gb());
+        free(warm);
+    }
     int *out = malloc((size_t)nfull * sizeof(int));
     if (!out) { fprintf(stderr, "OOM output ids\n"); return 1; }
     double t0 = now_s();
