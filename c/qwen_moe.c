@@ -7,6 +7,7 @@
  */
 #define _GNU_SOURCE
 #include <math.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -62,7 +63,7 @@ typedef struct {
     QwenLayer *L;
     QwenLayerCache *cache;
     uint64_t clock, hits, miss;
-    uint64_t prefetch_calls, forecast_items, forecast_skipped_cached;
+    uint64_t prefetch_calls, forecast_items, forecast_skipped_cached, prefetch_enqueued, prefetch_dropped;
     float **K, **V;
     int max_t;
     double dense_load_s;
@@ -71,6 +72,22 @@ typedef struct {
 static int g_speedax_prefetch = 0;
 static int g_speedax_pilot = 0;
 static int g_speedax_pilot_k = 0;
+
+typedef struct {
+    int layer, expert;
+} QwenPrefetchJob;
+
+typedef struct {
+    QwenModel *m;
+    QwenPrefetchJob q[4096];
+    unsigned r, w;
+    int started;
+    pthread_t th;
+    pthread_mutex_t mx;
+    pthread_cond_t cv;
+} QwenPrefetchQueue;
+
+static QwenPrefetchQueue g_qwen_pf;
 
 static int json_int_default(jval *root, const char *key, int fallback) {
     jval *v = json_get(root, key);
@@ -380,12 +397,7 @@ static int qwen_expert_cached(QwenModel *m, int layer, int eid) {
     return 0;
 }
 
-static void qwen_expert_prefetch(QwenModel *m, int layer, int eid) {
-    if (layer < 0 || layer >= m->c.n_layers || eid < 0 || eid >= m->c.n_experts) return;
-    if (qwen_expert_cached(m, layer, eid)) {
-        m->forecast_skipped_cached++;
-        return;
-    }
+static void qwen_expert_prefetch_raw(QwenModel *m, int layer, int eid) {
     char nm[512];
     const char *proj[] = {"gate_proj", "up_proj", "down_proj"};
     for (int p = 0; p < 3; p++) {
@@ -395,7 +407,60 @@ static void qwen_expert_prefetch(QwenModel *m, int layer, int eid) {
         snprintf(qs, sizeof(qs), "%s.qs", nm);
         st_prefetch(&m->S, qs);
     }
+}
+
+static void *qwen_prefetch_worker(void *arg) {
+    QwenPrefetchQueue *q = arg;
+    for (;;) {
+        pthread_mutex_lock(&q->mx);
+        while (q->r == q->w) pthread_cond_wait(&q->cv, &q->mx);
+        QwenPrefetchJob job = q->q[q->r & 4095u];
+        q->r++;
+        pthread_mutex_unlock(&q->mx);
+        qwen_expert_prefetch_raw(q->m, job.layer, job.expert);
+    }
+    return NULL;
+}
+
+static void qwen_prefetch_queue_start(QwenModel *m) {
+    if (g_qwen_pf.started) return;
+    memset(&g_qwen_pf, 0, sizeof(g_qwen_pf));
+    g_qwen_pf.m = m;
+    pthread_mutex_init(&g_qwen_pf.mx, NULL);
+    pthread_cond_init(&g_qwen_pf.cv, NULL);
+    if (pthread_create(&g_qwen_pf.th, NULL, qwen_prefetch_worker, &g_qwen_pf) != 0) {
+        perror("pthread_create qwen prefetch");
+        return;
+    }
+    pthread_detach(g_qwen_pf.th);
+    g_qwen_pf.started = 1;
+}
+
+static void qwen_expert_prefetch(QwenModel *m, int layer, int eid) {
+    if (layer < 0 || layer >= m->c.n_layers || eid < 0 || eid >= m->c.n_experts) return;
+    if (qwen_expert_cached(m, layer, eid)) {
+        m->forecast_skipped_cached++;
+        return;
+    }
+    qwen_prefetch_queue_start(m);
+    if (!g_qwen_pf.started) {
+        qwen_expert_prefetch_raw(m, layer, eid);
+        m->prefetch_calls++;
+        return;
+    }
+    pthread_mutex_lock(&g_qwen_pf.mx);
+    if (g_qwen_pf.w - g_qwen_pf.r >= 4096u) {
+        m->prefetch_dropped++;
+        pthread_mutex_unlock(&g_qwen_pf.mx);
+        return;
+    }
+    g_qwen_pf.q[g_qwen_pf.w & 4095u].layer = layer;
+    g_qwen_pf.q[g_qwen_pf.w & 4095u].expert = eid;
+    g_qwen_pf.w++;
+    m->prefetch_enqueued++;
     m->prefetch_calls++;
+    pthread_cond_signal(&g_qwen_pf.cv);
+    pthread_mutex_unlock(&g_qwen_pf.mx);
 }
 
 static void qwen_prefetch_forecast(QwenModel *m, const forecast_item *items, size_t n) {
@@ -806,9 +871,11 @@ int main(int argc, char **argv) {
            tot ? 100.0 * (double)m.hits / tot : 0.0,
            (unsigned long long)m.hits,
            (unsigned long long)m.miss);
-    printf("Speedax forecast items=%llu prefetch_calls=%llu skipped_cached=%llu observed=%d pilot=%d pilot_k=%d\n",
+    printf("Speedax forecast items=%llu prefetch_calls=%llu enqueued=%llu dropped=%llu skipped_cached=%llu observed=%d pilot=%d pilot_k=%d\n",
            (unsigned long long)m.forecast_items,
            (unsigned long long)m.prefetch_calls,
+           (unsigned long long)m.prefetch_enqueued,
+           (unsigned long long)m.prefetch_dropped,
            (unsigned long long)m.forecast_skipped_cached,
            g_speedax_prefetch,
            g_speedax_pilot,

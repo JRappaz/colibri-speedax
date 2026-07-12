@@ -89,7 +89,7 @@ qwen_moe: qwen_moe$(EXE)
 endif
 
 qwen_moe$(EXE): qwen_moe.c st.h json.h compat.h
-	$(CC) $(CFLAGS) qwen_moe.c -o qwen_moe$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) qwen_moe.c -o qwen_moe$(EXE) $(LDFLAGS) -pthread
 
 olmoe$(EXE): olmoe.c st.h json.h compat.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
